@@ -150,7 +150,7 @@ public class DBPortPool extends SimplePool<DBPort> {
 
     // ----
     
-    DBPortPool( ServerAddress addr , MongoOptions options ){
+    public DBPortPool( ServerAddress addr , MongoOptions options ){
         super( "DBPortPool-" + addr.toString() + ", options = " +  options.toString() , options.connectionsPerHost , options.connectionsPerHost );
         _options = options;
         _addr = addr;
@@ -161,20 +161,6 @@ public class DBPortPool extends SimplePool<DBPort> {
         return 0;
     }
 
-    protected int pick( int iThink , boolean couldCreate ){
-        final int id = System.identityHashCode(Thread.currentThread());
-        final int s = _availSafe.size();
-        for ( int i=0; i<s; i++ ){
-            DBPort p = _availSafe.get(i);
-            if ( p._lastThread == id )
-                return i;
-        }
-
-        if ( couldCreate )
-            return -1;
-        return iThink;
-    }
-    
     public DBPort get(){
         DBPort port = null;
         if ( ! _waitingSem.tryAcquire() )

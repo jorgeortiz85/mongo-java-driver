@@ -24,8 +24,11 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.management.Attribute;
 import javax.management.AttributeList;
@@ -111,27 +114,23 @@ public abstract class SimplePool<T> implements DynamicMBean {
         }
         
         if ( ! ok ){
-            synchronized ( _avail ){
-                _all.remove( t );
-            }
+            _all.remove( t );
             return;
         }
 
-        synchronized ( _avail ){
-            if ( _maxToKeep < 0 || _avail.size() < _maxToKeep ){
-                for ( int i=0; i<_avail.size(); i++ )
-                    if ( _avail.get( i ) == t )
-                        throw new RuntimeException( "trying to put something back in the pool that's already there" );
-                
-                // if all doesn't contain it, it probably means this was cleared, so we don't want it
-                if ( _all.contains( t ) ){
-                    _avail.add( t );
-                    _waiting.release();
-                }
+        if ( _maxToKeep < 0 || _avail.size() < _maxToKeep ){
+            if ( _avail.contains( t ) ){
+                throw new RuntimeException( "trying to put something back in the pool that's already there" );
             }
-            else {
-                cleanup( t );
+
+            // if all doesn't contain it, it probably means this was cleared, so we don't want it
+            if ( _all.contains( t ) ){
+                _avail.offer( t );
+                _waiting.release();
             }
+        }
+        else {
+            cleanup( t );
         }
     }
 
@@ -172,49 +171,43 @@ public abstract class SimplePool<T> implements DynamicMBean {
     }
     
     private T _get( long waitTime ){
-	long totalSlept = 0;
+    	long totalSlept = 0;
         while ( true ){
-            synchronized ( _avail ){
-                
-                boolean couldCreate = _maxTotal <= 0 || _all.size() < _maxTotal;
+            boolean couldCreate = _maxTotal <= 0 || _all.size() < _maxTotal;
 
-                while ( _avail.size() > 0 ){
-                    int toTake = _avail.size() - 1;
-                    toTake = pick( toTake, couldCreate );
-                    if ( toTake >= 0 ){
-                        T t = _avail.remove( toTake );
-                        if ( ok( t ) ){
-                            _debug( "got an old one" );
-                            return t;
-                        }
+            T t = null;
+            do {
+                t = _avail.poll();
+                if ( t != null ){
+                    if ( ok( t ) ){
+                        _debug( "got an old one" );
+                        return t;
+                    } else {
                         _debug( "old one was not ok" );
                         _all.remove( t );
                         continue;
                     }
-                    else if ( ! couldCreate ) {
-                        throw new IllegalStateException( "can't pick nothing if can't create" );
-                    }
-                    break;
                 }
-                
-                if ( couldCreate ){
-                    _everCreated++;
-                    T t = createNew();
-                    _all.add( t );
-                    return t;
-                }
-		
-                if ( _trackLeaks && _trackPrintCount++ % 200 == 0 ){
-                    _wherePrint();
-                    _trackPrintCount = 1;
-                }
-            }
-	    
-	    if ( waitTime == 0 )
-		return null;
+                break;
+            } while ( !_avail.isEmpty() );
 
-	    if ( waitTime > 0 && totalSlept >= waitTime )
-		return null;
+            if ( couldCreate ){
+                _everCreated.incrementAndGet();
+                t = createNew();
+                _all.put( t, t );
+                return t;
+            }
+	
+            if ( _trackLeaks && _trackPrintCount++ % 200 == 0 ){
+                _wherePrint();
+                _trackPrintCount = 1;
+            }
+
+    	    if ( waitTime == 0 )
+        		return null;
+
+    	    if ( waitTime > 0 && totalSlept >= waitTime )
+        		return null;
 	    
             long start = System.currentTimeMillis();
             try {
@@ -223,8 +216,7 @@ public abstract class SimplePool<T> implements DynamicMBean {
             catch ( InterruptedException ie ){
             }
 
-	    totalSlept += ( System.currentTimeMillis() - start );
-
+    	    totalSlept += ( System.currentTimeMillis() - start );
         }
     }
 
@@ -244,14 +236,14 @@ public abstract class SimplePool<T> implements DynamicMBean {
 
     /** Clears the pool of all objects. */
     protected void clear(){
-        synchronized( _avail ){
-            for ( T t : _avail )
-                cleanup( t );
-            _avail.clear();
-            _all.clear();
-            synchronized ( _where ){
-                _where.clear(); // is this correct
-            }
+        for ( T t : _avail )
+            cleanup( t );
+
+        _avail.clear();
+        _all.clear();
+
+        synchronized ( _where ){
+            _where.clear(); // is this correct
         }
     }
 
@@ -264,7 +256,7 @@ public abstract class SimplePool<T> implements DynamicMBean {
     }
 
     public Iterator<T> getAll(){
-        return _all.getAll().iterator();
+        return _all.keySet().iterator();
     }
 
     public int available(){
@@ -274,7 +266,7 @@ public abstract class SimplePool<T> implements DynamicMBean {
     }
 
     public int everCreated(){
-        return _everCreated;
+        return _everCreated.get();
     }
 
     private void _debug( String msg ){
@@ -296,7 +288,7 @@ public abstract class SimplePool<T> implements DynamicMBean {
         if ( attribute.equals( "inUse" ) )
             return inUse();
         if ( attribute.equals( "everCreated" ) )
-            return _everCreated;
+            return _everCreated.get();
         
         System.err.println( "com.mongo.util.SimplePool unknown attribute: " + attribute );
         throw new RuntimeException( "unknown attribute: " + attribute );
@@ -347,14 +339,13 @@ public abstract class SimplePool<T> implements DynamicMBean {
     protected final boolean _debug;
     protected final MBeanInfo _mbeanInfo;
 
-    private final List<T> _avail = new ArrayList<T>();
-    protected final List<T> _availSafe = Collections.unmodifiableList( _avail );
-    private final WeakBag<T> _all = new WeakBag<T>();
+    private final ConcurrentLinkedQueue<T> _avail = new ConcurrentLinkedQueue<T>();
+    private final ConcurrentHashMap<T, T> _all = new ConcurrentHashMap<T, T>();
     private final Map<Integer,Throwable> _where = new HashMap<Integer,Throwable>();
 
     private final Semaphore _waiting = new Semaphore(0);
 
-    private int _everCreated = 0;
+    private final AtomicInteger _everCreated = new AtomicInteger(0);
     private int _trackPrintCount = 0;
     
 }
